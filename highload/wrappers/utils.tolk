@@ -1,0 +1,282 @@
+import "@acton/crypto"
+import "@acton/ffi"
+import "@acton/emulation/network"
+import "@acton/emulation/testing"
+import "@acton/testing/assert"
+import "@acton/types/out_actions"
+import "HighloadWalletV3.gen"
+import "../contracts/messages"
+import "../contracts/storage"
+
+const HIGHLOAD_BIT_NUMBER_SIZE = 10
+const HIGHLOAD_MAX_INLINE_ACTIONS = 254
+const HIGHLOAD_CHAIN_CUT = 253
+
+struct HighloadExternalRequest {
+    messageToSend: cell
+    mode: int
+    queryId: int
+    createdAt: int
+    subwalletId: int
+    timeout: int
+}
+
+fun HighloadWalletV3.fromConfig(
+    publicKey: int,
+    subwalletId: int,
+    timeout: int,
+    toShard: AddressShardingOptions? = null,
+): HighloadWalletV3 {
+    return HighloadWalletV3.fromStorage(
+        HighloadWalletStorage {
+            publicKey,
+            subwalletId: subwalletId as uint32,
+            oldQueries: [],
+            queries: [],
+            lastCleanTime: 0,
+            timeout: timeout as uint22,
+        },
+        toShard,
+    );
+}
+
+fun HighloadWalletV3.code(self): cell {
+    if (self.stateInit == null) {
+        Assert.fail("Wrapper has no stateInit code (created via fromAddress)");
+    }
+    return self.stateInit!.code;
+}
+
+fun HighloadWalletV3.initialData(self): cell {
+    if (self.stateInit == null) {
+        Assert.fail("Wrapper has no stateInit data (created via fromAddress)");
+    }
+    return self.stateInit!.data;
+}
+
+fun HighloadWalletV3.isProcessed(self, queryId: int, needClean: bool = true): bool {
+    val cleanFlag = needClean ? -1 : 0;
+    return self.processed(queryId, cleanFlag);
+}
+
+fun HighloadWalletV3.queryIdShift(queryId: int): uint13 {
+    return (queryId >> HIGHLOAD_BIT_NUMBER_SIZE);
+}
+
+fun HighloadWalletV3.queryIdBitNumber(queryId: int): uint10 {
+    return (queryId & 1023);
+}
+
+fun packTlbOutActions(actions: array<TlbOutAction>): cell {
+    var head = createEmptyCell() as Cell<TlbOutList>;
+    var i = 0;
+    while (i < actions.size()) {
+        head = TlbOutList {
+            prev: head,
+            action: actions.get(i),
+        }.toCell();
+        i += 1;
+    }
+    return head;
+}
+
+fun packSendActionsToCell(messages: array<TlbOutActionSendMessage>, start: int, count: int): cell {
+    var head = createEmptyCell() as Cell<TlbOutList>;
+    var i = 0;
+    while (i < count) {
+        val action = messages.get(start + i);
+        head = TlbOutList {
+            prev: head,
+            action: action as TlbOutAction,
+        }.toCell();
+        i += 1;
+    }
+    return head;
+}
+
+fun HighloadWalletV3.createInternalTransferBody(
+    queryId: int,
+    actions: array<TlbOutAction>,
+): Cell<InternalTransfer> {
+    return InternalTransfer {
+        queryId: queryId as uint64,
+        actions: packTlbOutActions(actions),
+    }.toCell();
+}
+
+fun HighloadWalletV3.createInternalTransferBodyFromActionsCell(
+    queryId: int,
+    actionsCell: cell,
+): Cell<InternalTransfer> {
+    return InternalTransfer {
+        queryId: queryId as uint64,
+        actions: actionsCell,
+    }.toCell();
+}
+
+fun HighloadWalletV3.createInternalTransferMessage(
+    self,
+    queryId: int,
+    actions: array<TlbOutAction>,
+    value: coins = 0,
+): OutMessage {
+    val body = HighloadWalletV3.createInternalTransferBody(queryId, actions);
+    return createMessage({
+        bounce: false,
+        value,
+        dest: self.address,
+        body,
+    });
+}
+
+fun HighloadWalletV3.createInternalTransferMessageFromActionsCell(
+    self,
+    queryId: int,
+    actionsCell: cell,
+    value: coins = 0,
+): OutMessage {
+    val body = HighloadWalletV3.createInternalTransferBodyFromActionsCell(queryId, actionsCell);
+    return createMessage({
+        bounce: false,
+        value,
+        dest: self.address,
+        body,
+    });
+}
+
+fun HighloadWalletV3.packActions(
+    self,
+    messages: array<TlbOutActionSendMessage>,
+    value: coins,
+    queryId: int,
+): OutMessage {
+    return self.packActionsRange(messages, 0, messages.size(), value, queryId);
+}
+
+fun HighloadWalletV3.packActionsRange(
+    self,
+    messages: array<TlbOutActionSendMessage>,
+    start: int,
+    count: int,
+    value: coins,
+    queryId: int,
+): OutMessage {
+    if (count > HIGHLOAD_MAX_INLINE_ACTIONS) {
+        val chained = self.packActionsRange(
+            messages,
+            start + HIGHLOAD_CHAIN_CUT,
+            count - HIGHLOAD_CHAIN_CUT,
+            value,
+            queryId,
+        );
+        val chainMode = value > 0 ? SEND_MODE_PAY_FEES_SEPARATELY : SEND_MODE_CARRY_ALL_BALANCE;
+
+        var head = packSendActionsToCell(messages, start, HIGHLOAD_CHAIN_CUT) as Cell<TlbOutList>;
+        head = TlbOutList {
+            prev: head,
+            action: TlbOutActionSendMessage {
+                mode: chainMode,
+                outMsg: chained.messageCell,
+            } as TlbOutAction,
+        }.toCell();
+
+        return self.createInternalTransferMessageFromActionsCell(queryId, head, value);
+    }
+
+    val actionsCell = packSendActionsToCell(messages, start, count);
+    return self.createInternalTransferMessageFromActionsCell(queryId, actionsCell, value);
+}
+
+fun HighloadWalletV3.buildExternalRequestBody(
+    keyPair: KeyPair,
+    req: HighloadExternalRequest,
+): cell {
+    val inner = MsgInner {
+        subwalletId: req.subwalletId,
+        messageToSend: req.messageToSend,
+        sendMode: req.mode,
+        shift: HighloadWalletV3.queryIdShift(req.queryId),
+        bitNumber: HighloadWalletV3.queryIdBitNumber(req.queryId),
+        createdAt: req.createdAt,
+        timeout: req.timeout,
+    }.toCell();
+
+    val signature = crypto.sign(keyPair.privateKey, inner);
+    return beginCell().storeSlice(signature).storeRef(inner).endCell();
+}
+
+fun HighloadWalletV3.sendExternalRequest(
+    self,
+    keyPair: KeyPair,
+    req: HighloadExternalRequest,
+): SendResultList {
+    val body = HighloadWalletV3.buildExternalRequestBody(keyPair, req);
+    return self.sendRawExternalBody(body);
+}
+
+fun HighloadWalletV3.sendRawExternalBody(self, body: cell): SendResultList {
+    val res = net.sendExternal(net.createExternalMessage(self.address, body.beginParse()));
+    if (res == null) {
+        Assert.fail("External was not accepted");
+    }
+    return res;
+}
+
+fun HighloadWalletV3.trySendRawExternalBody(self, body: cell): SendResultList? {
+    val msg = net.createExternalMessage(self.address, body.beginParse());
+    val extSrc = address("-1:0000000000000000000000000000000000000000000000000000000000000000");
+    return ffi.sendMessageFrom(msg.messageCell, extSrc.toCell());
+}
+
+fun HighloadWalletV3.trySendRawExternalBodySingle(self, body: cell): SendResult? {
+    val msg = net.createExternalMessage(self.address, body.beginParse());
+    val extSrc = address("-1:0000000000000000000000000000000000000000000000000000000000000000");
+    val raw = ffi.sendSingleMessage(msg.messageCell, extSrc.toCell());
+    if (raw == null) {
+        return null;
+    }
+    return SendResult.fromTuple(raw);
+}
+
+fun HighloadWalletV3.sendBatch(
+    self,
+    keyPair: KeyPair,
+    messages: array<TlbOutActionSendMessage>,
+    subwalletId: int,
+    queryId: int,
+    timeout: int,
+    createdAt: int,
+    value: coins = 0,
+): SendResultList {
+    val internalTransfer = self.packActions(messages, value, queryId);
+    val mode = value > 0 ? SEND_MODE_PAY_FEES_SEPARATELY : SEND_MODE_CARRY_ALL_BALANCE;
+    return self.sendExternalRequest(
+        keyPair,
+        HighloadExternalRequest {
+            messageToSend: internalTransfer.messageCell,
+            mode,
+            queryId,
+            createdAt,
+            subwalletId,
+            timeout,
+        },
+    );
+}
+
+fun HighloadWalletV3.trySendExternalRequest(
+    self,
+    keyPair: KeyPair,
+    req: HighloadExternalRequest,
+): SendResultList? {
+    val body = HighloadWalletV3.buildExternalRequestBody(keyPair, req);
+    return self.trySendRawExternalBody(body);
+}
+
+fun HighloadWalletV3.trySendExternalRequestSingle(
+    self,
+    keyPair: KeyPair,
+    req: HighloadExternalRequest,
+): SendResult? {
+    val body = HighloadWalletV3.buildExternalRequestBody(keyPair, req);
+    return self.trySendRawExternalBodySingle(body);
+}
